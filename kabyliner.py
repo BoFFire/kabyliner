@@ -1,118 +1,133 @@
 import os
 import requests
 import xml.etree.ElementTree as ET
+import csv
+from pathlib import Path
 
+# ======================= TMX Download & Processing ========================
 def download_tmx(url, local_filename):
-    """
-    Downloads the TMX file from the given URL and saves it locally.
-    
-    If the file already exists locally, it compares the local file size with
-    the remote file size. If sizes match, the download is skipped.
-    """
-    # Check if the file exists locally.
+    """Downloads TMX file with size validation."""
     if os.path.exists(local_filename):
         local_size = os.path.getsize(local_filename)
-        # Get remote file size using a HEAD request.
         head_response = requests.head(url, allow_redirects=True)
         remote_size = int(head_response.headers.get("Content-Length", -1))
         if remote_size == local_size:
-            print(f"File '{local_filename}' already exists with matching size ({local_size} bytes). Skipping download.")
+            print(f"File '{local_filename}' exists with matching size. Skipping download.")
             return
-        else:
-            print(f"Local file '{local_filename}' exists but sizes differ (local: {local_size} bytes, remote: {remote_size} bytes). Redownloading.")
 
-    print(f"Downloading TMX file from {url} ...")
+    print(f"Downloading TMX file from {url}...")
     response = requests.get(url)
     if response.status_code == 200:
         with open(local_filename, "wb") as f:
             f.write(response.content)
-        print(f"Downloaded TMX file saved as: {local_filename}")
+        print(f"Download saved as: {local_filename}")
     else:
-        raise Exception(f"Failed to download TMX file. Status code: {response.status_code}")
+        raise Exception(f"Download failed. Status code: {response.status_code}")
 
 def extract_parallel_corpus(tmx_file, tsv_file="parallel_corpus.tsv", src_lang="en", tgt_lang="kab"):
-    """
-    Extracts a parallel corpus from a TMX file and saves it as a TSV file.
-    
-    Handles multiple segments (e.g., plural or multi-paragraph entries) for each
-    language by joining them with a space.
-    """
+    """Extracts parallel corpus from TMX with namespace handling."""
     tree = ET.parse(tmx_file)
     root = tree.getroot()
-    
+    namespace = {'tmx': root.tag.split('}')[0][1:]} if '}' in root.tag else {'tmx': ''}
+
     with open(tsv_file, "w", encoding="utf-8") as out_file:
-        # Write header
         out_file.write(f"{src_lang}\t{tgt_lang}\n")
         
-        for tu in root.findall(".//tu"):
-            # Collect segments in lists for each language.
+        for tu in root.findall(".//tmx:tu", namespace):
             texts = {src_lang: [], tgt_lang: []}
-            
-            for tuv in tu.findall("tuv"):
+            for tuv in tu.findall("tmx:tuv", namespace):
                 lang = tuv.get("{http://www.w3.org/XML/1998/namespace}lang")
                 if lang in [src_lang, tgt_lang]:
-                    seg = tuv.find("seg")
-                    if seg is not None and seg.text:
-                        texts[lang].append(''.join(seg.itertext()).strip())
+                    seg = tuv.find("tmx:seg", namespace)
+                    if seg is not None:
+                        text = ''.join(seg.itertext()).strip()
+                        if text: texts[lang].append(text)
             
-            # Write pairs only if both languages have at least one segment.
             if texts[src_lang] and texts[tgt_lang]:
-                src_text = " ".join(texts[src_lang])
-                tgt_text = " ".join(texts[tgt_lang])
-                out_file.write(f"{src_text}\t{tgt_text}\n")
+                out_file.write(f"{' '.join(texts[src_lang])}\t{' '.join(texts[tgt_lang])}\n")
     
-    print(f"Parallel corpus extracted to {tsv_file}")
+    print(f"Raw corpus extracted to {tsv_file}")
 
+# ======================= Corpus Cleaning ========================
+def clean_corpus(input_path, output_path, verbose=False):
+    """Cleans the TSV corpus by removing invalid entries."""
+    if not Path(input_path).exists():
+        raise FileNotFoundError(f"Input file {input_path} not found")
+    
+    kept = 0
+    removed = 0
+    
+    with open(input_path, 'r', encoding="utf-8") as infile, \
+         open(output_path, 'w', encoding="utf-8", newline='') as outfile:
+        
+        reader = csv.reader(infile, delimiter='\t')
+        writer = csv.writer(outfile, delimiter='\t')
+        
+        try:
+            header = next(reader)
+            if header != ['en', 'kab']:
+                raise ValueError("Invalid header format. Expected ['en', 'kab']")
+            writer.writerow(header)
+        except StopIteration:
+            raise ValueError("Empty input file")
+        
+        for row in reader:
+            if len(row) == 2 and row[0].strip() and row[1].strip():
+                writer.writerow(row)
+                kept += 1
+            else:
+                removed += 1
+            
+            if verbose and (kept + removed) % 1000 == 0:
+                print(f"Processed {kept + removed} rows...")
+    
+    print(f"\nCleaning results:")
+    print(f"  Total rows processed: {kept + removed}")
+    print(f"  Valid pairs kept: {kept}")
+    print(f"  Invalid pairs removed: {removed}")
+    
+    return kept, removed
+
+# ======================= File Splitting ========================
 def split_tsv_to_txt(tsv_file, en_file="en.txt", kab_file="kab.txt"):
-    """
-    Splits a TSV file (with a header) into two separate text files:
-    one for English and one for Kabyle.
-    """
-    with open(tsv_file, "r", encoding="utf-8") as infile, \
-         open(en_file, "w", encoding="utf-8") as en_out, \
-         open(kab_file, "w", encoding="utf-8") as kab_out:
+    """Splits cleaned TSV into separate text files."""
+    with open(tsv_file, 'r', encoding="utf-8") as infile, \
+         open(en_file, 'w', encoding="utf-8") as en_out, \
+         open(kab_file, 'w', encoding="utf-8") as kab_out:
         
-        next(infile)  # Skip the header line
-        
+        next(infile)  # Skip header
         for line in infile:
-            parts = line.strip().split("\t")
-            if len(parts) == 2:
-                en_sentence, kab_sentence = parts
-                en_out.write(en_sentence + "\n")
-                kab_out.write(kab_sentence + "\n")
+            en, kab = line.strip().split('\t')
+            en_out.write(f"{en}\n")
+            kab_out.write(f"{kab}\n")
     
-    print(f"Extracted sentences to {en_file} and {kab_file}")
+    print(f"Split into {en_file} and {kab_file}")
 
-def count_lines(file_path):
-    """Counts the number of lines in a file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return sum(1 for _ in f)
-
+# ======================= Main Execution ========================
 if __name__ == "__main__":
-    # URL for the TMX file.
-    tmx_url = "https://gitlab.com/imsidag/taqbaylit/-/raw/master/tmx/kabyle-tm.tmx?ref_type=heads"
-    local_tmx = "kabyle-tm.tmx"
+    # Configuration
+    TMX_URL = "https://gitlab.com/imsidag/taqbaylit/-/raw/master/tmx/kabyle-tm.tmx?ref_type=heads"
+    TMX_FILE = "kabyle-tm.tmx"
+    RAW_TSV = "parallel_corpus.raw.tsv"
+    CLEAN_TSV = "parallel_corpus.clean.tsv"
+    EN_FILE = "en.txt"
+    KAB_FILE = "kab.txt"
+
+    try:
+        # Pipeline execution
+        download_tmx(TMX_URL, TMX_FILE)
+        extract_parallel_corpus(TMX_FILE, RAW_TSV)
+        kept, removed = clean_corpus(RAW_TSV, CLEAN_TSV, verbose=True)
+        split_tsv_to_txt(CLEAN_TSV, EN_FILE, KAB_FILE)
+        
+        # Final report
+        def count_lines(f): return sum(1 for _ in open(f, 'r', encoding="utf-8"))
+        print("\nFinal counts:")
+        print(f"- Cleaned translation pairs: {kept}")
+        print(f"- Removed invalid pairs: {removed}")
+        print(f"- English sentences: {count_lines(EN_FILE)}")
+        print(f"- Kabyle sentences: {count_lines(KAB_FILE)}")
     
-    # Download the TMX file (if necessary).
-    download_tmx(tmx_url, local_tmx)
-    
-    # File names for the outputs.
-    tsv_filename = "parallel_corpus.tsv"
-    en_filename = "en.txt"
-    kab_filename = "kab.txt"
-    
-    # Step 1: Extract the parallel corpus from the TMX file.
-    extract_parallel_corpus(local_tmx, tsv_filename, src_lang="en", tgt_lang="kab")
-    
-    # Step 2: Split the TSV file into en.txt and kab.txt.
-    split_tsv_to_txt(tsv_filename, en_filename, kab_filename)
-    
-    # Step 3: Count the number of lines in each file.
-    # For the TSV file, subtract 1 to ignore the header.
-    tsv_lines = count_lines(tsv_filename) - 1  
-    en_lines = count_lines(en_filename)
-    kab_lines = count_lines(kab_filename)
-    
-    print(f"Number of translation pairs (TSV, excluding header): {tsv_lines}")
-    print(f"Number of English sentences (en.txt): {en_lines}")
-    print(f"Number of Kabyle sentences (kab.txt): {kab_lines}")
+    except Exception as e:
+        print(f"\nError in processing pipeline: {str(e)}")
+        exit(1)
